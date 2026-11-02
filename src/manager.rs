@@ -137,7 +137,11 @@ impl<T> HotkeyManager<T> {
                             continue;
                         }
                         if hotkey.is_trigger_state(state) {
-                            if state.is_down(VKey::LWin.to_vk_code()) {
+                            // Win: suppress the Start menu; Alt: suppress menu-bar activation on a lone Alt release
+                            if state.is_down(VKey::LWin.to_vk_code())
+                                || state.is_down(VKey::LMenu.to_vk_code())
+                                || state.is_down(VKey::RMenu.to_vk_code())
+                            {
                                 hook.key_action(KeyAction::Replace);
                             } else {
                                 hook.key_action(KeyAction::Block);
