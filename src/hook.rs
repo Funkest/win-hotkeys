@@ -5,17 +5,19 @@
 
 use crate::state::KeyboardState;
 use crossbeam_channel::{unbounded, Receiver, RecvError, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::Duration;
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
-    VIRTUAL_KEY,
+    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_LMENU, VK_MENU, VK_RMENU,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, SetWindowsHookExW, TranslateMessage,
-    UnhookWindowsHookEx, KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_SYSKEYDOWN,
+    UnhookWindowsHookEx, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, WH_KEYBOARD_LL, WM_KEYDOWN,
+    WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 /// Timeout for blocking key events, measured in milliseconds.
@@ -23,6 +25,16 @@ const TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Unassigned Virtual Key code used to suppress Windows Key events.
 const SILENT_KEY: VIRTUAL_KEY = VIRTUAL_KEY(0xE8);
+
+/// Set when a hotkey fired with Alt held; the next Alt release is then masked.
+///
+/// The silent key sent at trigger time reaches the window that was in the
+/// foreground then. When the hotkey switches windows (e.g. a komorebi focus
+/// command), the Alt release lands on the new foreground window, which may
+/// still treat it as a lone Alt press and enter menu mode. Masking the release
+/// itself (silent key, then Alt up, in one SendInput) closes that gap, as
+/// AutoHotkey's #MenuMaskKey does.
+static MASK_ALT_RELEASE: AtomicBool = AtomicBool::new(false);
 
 /// Channel sender used by hook proc to send keyboard events.
 pub static HOOK_EVENT_TX: RwLock<Option<Sender<KeyboardEvent>>> = RwLock::new(None);
@@ -190,6 +202,37 @@ unsafe fn send_silent_key() {
     SendInput(&inputs, size_of::<INPUT>() as i32);
 }
 
+/// Sends the silent key, then re-sends the (blocked) Alt release, in one batch so the order holds.
+unsafe fn send_masked_alt_release(hook: &KBDLLHOOKSTRUCT) {
+    let alt_flags = if hook.flags.0 & LLKHF_EXTENDED.0 != 0 {
+        KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY
+    } else {
+        KEYEVENTF_KEYUP
+    };
+    let key = |vk: VIRTUAL_KEY, scan: u16, flags: KEYBD_EVENT_FLAGS| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: vk,
+                wScan: scan,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    let inputs = [
+        key(SILENT_KEY, 0, KEYBD_EVENT_FLAGS(0)),
+        key(SILENT_KEY, 0, KEYEVENTF_KEYUP),
+        key(VIRTUAL_KEY(hook.vkCode as u16), hook.scanCode as u16, alt_flags),
+    ];
+    SendInput(&inputs, size_of::<INPUT>() as i32);
+}
+
+fn is_alt(vk_code: u16) -> bool {
+    vk_code == VK_LMENU.0 || vk_code == VK_RMENU.0 || vk_code == VK_MENU.0
+}
+
 /// Hook procedure for handling keyboard events.
 unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 {
@@ -199,9 +242,20 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         let response_rx = response_guard.as_ref().unwrap();
 
         let event_type = wparam.0 as u32;
-        let vk_code = (*(lparam.0 as *const KBDLLHOOKSTRUCT)).vkCode as u16;
+        let hook_struct = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+        let vk_code = hook_struct.vkCode as u16;
         if vk_code == SILENT_KEY.0 {
             return CallNextHookEx(None, code, wparam, lparam);
+        }
+
+        // first Alt release after an Alt-modified hotkey: block it and replay it behind the silent key;
+        // the flag is cleared first, so the replayed release passes through below
+        if matches!(event_type, WM_KEYUP | WM_SYSKEYUP)
+            && is_alt(vk_code)
+            && MASK_ALT_RELEASE.swap(false, Ordering::SeqCst)
+        {
+            send_masked_alt_release(hook_struct);
+            return LRESULT(1);
         }
 
         match event_type {
@@ -225,6 +279,10 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
                         }
                         KeyAction::Replace => {
                             send_silent_key();
+                            let state = KEYBOARD_STATE.get().unwrap().lock().unwrap();
+                            if state.is_down(VK_LMENU.0) || state.is_down(VK_RMENU.0) {
+                                MASK_ALT_RELEASE.store(true, Ordering::SeqCst);
+                            }
                             return LRESULT(1);
                         }
                         KeyAction::Allow => {}
